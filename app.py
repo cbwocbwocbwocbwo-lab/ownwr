@@ -382,13 +382,14 @@ def parse_single_pdf(file_like, filename):
             ap    = "O" if (ap_eul == "O" or re.search(r"(?<!가)압류", gabgu_text) or ap_gabgu == "O") else "X"
             ga_ap = "O" if (ga_ap_eul == "O" or "가압류" in gabgu_text or ga_ap_gabgu == "O") else "X"
 
-        # 재계약여부: 가등기 O 또는 (갑구/을구 텍스트에 경매/경매개시/경매개시결정) 또는 압류 O → X
+        # 재계약여부: 가등기·압류·가압류 O 또는 경매/가처분이 있으면 X
         both_text = f"{eul_text}\n{gabgu_text}"
         has_gadeung = (ga_deung == "O")
         has_gyeongmae = any(k in both_text for k in ["경매", "경매개시", "경매개시결정"])
         has_apryu = (ap == "O")
+        has_gaapryu = (ga_ap == "O")
         has_gachobeon = ("가처분" in gabgu_text)
-        re_contract = "X" if (has_gadeung or has_gyeongmae or has_apryu or has_gachobeon) else "O"
+        re_contract = "X" if (has_gadeung or has_gyeongmae or has_apryu or has_gaapryu or has_gachobeon) else "O"
 
         # ===== 고유번호 단위 레코드 생성 =====
         for i, ln in enumerate(lines):
