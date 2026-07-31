@@ -26,6 +26,64 @@ def normalize(s: str) -> str:
     s = re.sub(r"[ \t]+", " ", s)
     return s.strip()
 
+
+def normalize_for_owner_header_similarity(value) -> str:
+    """표 머리글 오인식 여부를 비교하기 위한 형태로 정리한다."""
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", str(value or ""))
+
+
+def is_registration_owner_header_like(value) -> bool:
+    """소유주로 잘못 추출된 '등기명의인 (주민)등록번호 최종' 머리글을 찾는다."""
+    target = "등기명의인주민등록번호최종"
+    normalized = normalize_for_owner_header_similarity(value)
+    if not normalized:
+        return False
+    if normalized == target or target in normalized:
+        return True
+    if abs(len(normalized) - len(target)) > 4:
+        return False
+
+    # OCR/PDF 텍스트 추출 과정에서 일부 글자가 달라진 경우도 허용한다.
+    previous = list(range(len(target) + 1))
+    for left_index, left_char in enumerate(normalized, start=1):
+        current = [left_index]
+        for right_index, right_char in enumerate(target, start=1):
+            cost = 0 if left_char == right_char else 1
+            current.append(min(
+                previous[right_index] + 1,
+                current[right_index - 1] + 1,
+                previous[right_index - 1] + cost,
+            ))
+        previous = current
+
+    distance = previous[-1]
+    similarity = 1 - distance / max(len(normalized), len(target))
+    return similarity >= 0.82
+
+
+def normalize_owner_text(value):
+    """PDF 추출 과정에서 소유주 칸에 붙은 머리글·번호·지분 정보를 정리한다."""
+    if value is None:
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return value
+
+    if is_registration_owner_header_like(text):
+        return "국(소유자)"
+
+    # 주민번호, 등록번호, 지분·주소가 이름에 이어 붙은 경우 숫자 시작 전까지만 보존한다.
+    before_serial_number = re.match(r"^(.+?)(?=\d{4,})", text)
+    if before_serial_number:
+        text = re.sub(r"[,\s]+$", "", before_serial_number.group(1)).strip()
+
+    # PDF 추출 중 법인명의 마지막 글자가 잘리는 사례를 보정한다.
+    if text.endswith("주식회"):
+        text = f"{text}사"
+
+    return text
+
 def find_gabgu_rows(lines):
     """
     '2. 소유권에 관한 사항 (갑구)' 구간에서
@@ -336,7 +394,7 @@ def parse_single_pdf(file_like, filename):
         for i, ln in enumerate(lines):
             if "고유번호" in ln:
                 uid, addr = extract_uid_and_address(lines, i)
-                owners = extract_owners(lines, i, window=40)
+                owners = normalize_owner_text(extract_owners(lines, i, window=40))
                 rows_out.append({
                     "화일명": filename,
                     "소유주": owners,
