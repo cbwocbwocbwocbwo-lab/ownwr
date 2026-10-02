@@ -21,7 +21,6 @@ MC_NUMBER_PATTERN = re.compile(r"(?<![A-Z0-9])(MC\d{8})(?=[^0-9]|$)", re.IGNOREC
 REFERENCE_MC_HEADER = "임차물건 번호"
 REFERENCE_OWNER_HEADER = "대표자명"
 OWNER_MATCH_COLUMN = "MC물건(소유주 일치?)"
-JEV_MATCH_THRESHOLD = 0.90
 
 # ===== 유틸 =====
 def normalize(s: str) -> str:
@@ -107,20 +106,72 @@ def normalize_name_for_comparison(value):
     return re.sub(r"\s+", "", str(value).strip())
 
 
-def owners_match_by_rule(registry_owners, reference_owners):
-    """완전 일치 또는 엑셀 대표자명 전체가 등기 소유주에 포함되면 True."""
-    registry_normalized = normalize_name_for_comparison(registry_owners)
-    if not registry_normalized or registry_normalized == "미확인":
-        return False
+def split_registry_owner_names(value):
+    """쉼표 등으로 구분된 등기 소유주를 중복 없는 이름 목록으로 만든다."""
+    if value is None or pd.isna(value):
+        return []
+
+    names = []
+    seen = set()
+    for part in re.split(r"\s*[,，;/·、]\s*", str(value).strip()):
+        name = part.strip()
+        normalized = normalize_name_for_comparison(name)
+        if not normalized or normalized == "미확인" or normalized in seen:
+            continue
+        seen.add(normalized)
+        names.append(name)
+    return names
+
+
+def parse_representative_summary(value):
+    """'김병수외 1명'을 ('김병수', 1)로 해석한다."""
+    normalized = normalize_name_for_comparison(value)
+    match = re.fullmatch(r"(.+?)외(\d+)(?:명|인)?", normalized)
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def evaluate_owners_by_rule(registry_owners, reference_owners):
+    """코드로 확정 가능한 일치/불일치와 수동 확인 대상을 구분한다."""
+    registry_names = split_registry_owner_names(registry_owners)
+    if not registry_names:
+        return "review"
+
+    registry_normalized = {
+        normalize_name_for_comparison(name) for name in registry_names
+    }
+    needs_review = False
+    has_definite_count_mismatch = False
 
     for reference_owner in reference_owners:
+        summary = parse_representative_summary(reference_owner)
+        if summary:
+            representative, additional_count = summary
+            representative_normalized = normalize_name_for_comparison(representative)
+            expected_owner_count = additional_count + 1
+
+            if representative_normalized in registry_normalized:
+                if len(registry_names) == expected_owner_count:
+                    return "match"
+                has_definite_count_mismatch = True
+            else:
+                # '김병수' ↔ '병수'처럼 OCR 누락 가능성이 있는 경우를
+                # 코드에서 억지로 확정하지 않고 사용자가 확인하도록 남긴다.
+                needs_review = True
+            continue
+
         reference_normalized = normalize_name_for_comparison(reference_owner)
-        if reference_normalized and (
-            registry_normalized == reference_normalized
-            or reference_normalized in registry_normalized
-        ):
-            return True
-    return False
+        if reference_normalized and reference_normalized in registry_normalized:
+            return "match"
+        if reference_normalized:
+            needs_review = True
+
+    if needs_review:
+        return "review"
+    if has_definite_count_mismatch:
+        return "mismatch"
+    return "review"
 
 
 def load_owner_reference(excel_file):
@@ -160,83 +211,23 @@ def load_owner_reference(excel_file):
     return owner_reference, selected_sheet
 
 
-def evaluate_owner_pairs_with_jev(pairs, api_key, batch_size=25):
-    """규칙으로 판단하지 못한 이름 쌍을 Jev Noul 확률로 평가한다."""
-    results = {pair_key: None for pair_key in pairs}
-    if not pairs or not api_key.strip():
-        return results, None
-
-    try:
-        from typesafe_sdk import TypeSafeClient
-    except ImportError:
-        return results, "TypeSafe SDK가 설치되어 있지 않습니다."
-
-    pair_items = list(pairs.items())
-    try:
-        with TypeSafeClient(
-            api_key=api_key.strip(),
-            model="jev-latest",
-            timeout=30.0,
-        ) as client:
-            for start in range(0, len(pair_items), batch_size):
-                batch = pair_items[start:start + batch_size]
-                comparisons = []
-                questions = {}
-
-                for local_index, (_, pair) in enumerate(batch):
-                    comparisons.append({
-                        "excel_representatives": pair["reference_owners"],
-                        "registry_owners": pair["registry_owners"],
-                    })
-                    question_id = f"owner_match_{local_index}"
-                    questions[question_id] = {
-                        "type": "noul",
-                        "instructions": (
-                            "Do `comparisons[{0}].excel_representatives` and "
-                            "`comparisons[{0}].registry_owners` refer to the same person "
-                            "or legal entity? Treat harmless spacing, punctuation, name-order, "
-                            "OCR truncation, and standard corporate-designator variations as "
-                            "matches, but do not match unrelated people merely because they "
-                            "share a short substring."
-                        ).format(local_index),
-                        "criteria": {
-                            "true": "At least one Excel representative is the same owner as a registry owner.",
-                            "false": "They are different owners or there is not enough evidence to identify them as the same.",
-                        },
-                    }
-
-                response = client.system_one(
-                    state={"comparisons": comparisons},
-                    questions=questions,
-                )
-
-                for local_index, (pair_key, _) in enumerate(batch):
-                    answer = response.answers[f"owner_match_{local_index}"]
-                    results[pair_key] = float(answer.noul)
-    except Exception as exc:
-        # API 키와 응답 원문은 로그나 화면에 노출하지 않는다.
-        return results, f"Jev 처리 실패({type(exc).__name__})"
-
-    return results, None
-
-
 def combine_recontract_with_owner_status(recontract, owner_status):
     """기존 O/X 재계약 판정에 소유자 확인 결과를 결합한다."""
     base = str(recontract or "").split("(", 1)[0].strip()
-    if owner_status in {"일치", "일치(J)"}:
+    if owner_status == "일치":
         return f"{base}(소유자 일치)"
-    if owner_status in {"불일치(J)", "불일치(J불가)"}:
+    if owner_status == "불_일치":
         return f"{base}(소유자 불_일치)"
+    if owner_status == "확인 필요":
+        return f"{base}(소유자 확인 필요)"
     if owner_status == "엑셀 조회 불가":
         return f"{base}(소유자 확인 불가)"
     return base
 
 
-def apply_owner_reference_results(df, owner_reference, api_key):
-    """MC번호/대표자명 비교, 필요한 Jev 판정, 재계약여부 결합을 수행한다."""
+def apply_owner_reference_results(df, owner_reference):
+    """MC번호와 대표자명을 코드로 비교하고 재계약여부에 결합한다."""
     statuses = {}
-    pending_pairs = {}
-    pending_rows = {}
 
     for row_index, row in df.iterrows():
         mc_number = extract_mc_number(row.get("화일명"))
@@ -245,36 +236,23 @@ def apply_owner_reference_results(df, owner_reference, api_key):
 
         if not reference_owners:
             statuses[row_index] = "엑셀 조회 불가"
-        elif owners_match_by_rule(registry_owners, reference_owners):
-            statuses[row_index] = "일치"
         elif not registry_owners or registry_owners == "미확인":
-            statuses[row_index] = "불일치(J불가)"
+            statuses[row_index] = "확인 필요"
         else:
-            pair_key = (tuple(reference_owners), registry_owners)
-            pending_pairs[pair_key] = {
-                "reference_owners": reference_owners,
-                "registry_owners": registry_owners,
-            }
-            pending_rows.setdefault(pair_key, []).append(row_index)
-
-    jev_results, jev_error = evaluate_owner_pairs_with_jev(pending_pairs, api_key)
-    for pair_key, row_indices in pending_rows.items():
-        probability = jev_results.get(pair_key)
-        if probability is None:
-            status = "불일치(J불가)"
-        elif probability >= JEV_MATCH_THRESHOLD:
-            status = "일치(J)"
-        else:
-            status = "불일치(J)"
-        for row_index in row_indices:
-            statuses[row_index] = status
+            rule_decision = evaluate_owners_by_rule(registry_owners, reference_owners)
+            if rule_decision == "match":
+                statuses[row_index] = "일치"
+            elif rule_decision == "mismatch":
+                statuses[row_index] = "불_일치"
+            else:
+                statuses[row_index] = "확인 필요"
 
     df[OWNER_MATCH_COLUMN] = df.index.map(statuses)
     df["재계약여부"] = [
         combine_recontract_with_owner_status(recontract, owner_status)
         for recontract, owner_status in zip(df["재계약여부"], df[OWNER_MATCH_COLUMN])
     ]
-    return df, jev_error
+    return df
 
 def find_gabgu_rows(lines):
     """
@@ -328,7 +306,8 @@ def extract_owners(lines, start_idx, window=80):
     for i, line in enumerate(seg):
         if "(소유자)" in line or "(공유자)" in line:
             base = line.split("(")[0].strip()
-            # 같은 줄의 앞부분이 너무 짧으면(예: '원', '행') 바로 윗줄과 결합해 복원
+            # PDF 표의 줄바꿈 때문에 법인명/이름이 등록번호 앞줄과 역할표시 줄로
+            # 나뉘는 경우가 있어, 윗줄의 등록번호 앞 이름 조각과 결합한다.
             def prev_non_empty(k):
                 j = k - 1
                 while j >= 0 and not seg[j].strip():
@@ -336,14 +315,26 @@ def extract_owners(lines, start_idx, window=80):
                 return seg[j] if j >= 0 else ""
 
             base_no_space = base.replace(" ", "")
-            if len(base_no_space) <= 2:
-                prev = prev_non_empty(i).replace(" ", "")
-                base = (prev + base_no_space)
+            prev = prev_non_empty(i)
+            registration_match = re.search(r"\d{6,}-(?:\d|\*){3,}", prev)
+            if registration_match:
+                prev_name = prev[:registration_match.start()].replace(" ", "").strip()
+                if prev_name:
+                    if base_no_space in prev_name:
+                        base = prev_name
+                    elif prev_name in base_no_space:
+                        base = base_no_space
+                    else:
+                        base = prev_name + base_no_space
+                else:
+                    base = base_no_space
+            elif len(base_no_space) <= 2:
+                base = prev.replace(" ", "") + base_no_space
             else:
                 base = base_no_space
 
             # 등록번호·보조 문구·역할 괄호 제거
-            base = re.split(r"\d{6,}-\d{3,}", base)[0]
+            base = re.split(r"\d{6,}-(?:\d|\*){3,}", base)[0]
             base = re.split(r"(단독소유|공유|각|지분|주소|소재지|주\s*소)", base)[0]
             base = re.sub(r"\((?:소유자|공유자|수탁자|위탁자)\)", "", base)
             base = normalize(base)
@@ -652,7 +643,8 @@ st.caption(
     "근저당/가등기/압류/가압류는 O/X, 기타는 권리명만. "
     "재계약여부는 (가등기·경매·압류 중 하나라도 있으면 X, 아니면 O). "
     "※ 분석 범위: '주요 등기사항 요약' 1쪽, 갑구+을구의 '행' 전체를 참조(압류/가압류 병합 포함). "
-    "기준 엑셀의 '임차물건 번호'와 '대표자명'을 사용해 소유주 일치 여부도 확인합니다."
+    "기준 엑셀의 '임차물건 번호'와 '대표자명'을 사용해 소유주 일치 여부도 확인하며, "
+    "코드로 확정하기 어려운 경우는 '확인 필요'로 표시합니다."
 )
 
 uploaded_files = st.file_uploader(
@@ -660,36 +652,6 @@ uploaded_files = st.file_uploader(
     type=["pdf", "zip", "xlsx"],
     accept_multiple_files=True
 )
-
-
-def clear_jev_api_key():
-    st.session_state["jev_api_key"] = ""
-
-
-def handle_jev_toggle():
-    if not st.session_state.get("use_jev", False):
-        st.session_state["jev_api_key"] = ""
-
-
-use_jev = st.checkbox(
-    "Jev 사용 (코드 비교로 판단하지 못한 소유주만 추가 확인)",
-    key="use_jev",
-    on_change=handle_jev_toggle,
-)
-api_key = ""
-if use_jev:
-    api_key = st.text_input(
-        "Jev API 키",
-        type="password",
-        autocomplete="off",
-        key="jev_api_key",
-        help="현재 사용자 세션에서 API 호출에만 사용하며 결과·엑셀·로그·캐시에 저장하지 않습니다.",
-    )
-    st.button(
-        "API 키 지우기",
-        on_click=clear_jev_api_key,
-        disabled=not bool(api_key),
-    )
 
 run = st.button("실행")
 
@@ -738,14 +700,13 @@ if run:
         df = pd.DataFrame(all_rows)
         # 순번 부여
         df.insert(0, "순번", range(1, len(df) + 1))
-        df, jev_error = apply_owner_reference_results(df, owner_reference, api_key)
+        df = apply_owner_reference_results(df, owner_reference)
         # 열 순서 고정 (요청 반영)
         desired_cols = ["순번","화일명","소유주","고유번호","주소","근저당","가등기","압류","가압류","기타",OWNER_MATCH_COLUMN,"재계약여부"]
         df = df[[col for col in desired_cols if col in df.columns]]
-        if jev_error:
-            st.warning(f"{jev_error} — Jev가 필요한 행은 '불일치(J불가)'로 기록했습니다.")
-        elif not api_key.strip() and (df[OWNER_MATCH_COLUMN] == "불일치(J불가)").any():
-            st.info("Jev API 키가 입력되지 않아 추가 판단이 필요한 행은 '불일치(J불가)'로 기록했습니다.")
+        review_count = int((df[OWNER_MATCH_COLUMN] == "확인 필요").sum())
+        if review_count:
+            st.info(f"소유주를 코드로 확정하기 어려운 {review_count}건은 '확인 필요'로 표시했습니다.")
         st.caption(
             f"기준 엑셀: {excel_files[0].name} / 시트: {reference_sheet} / "
             f"MC번호 {len(owner_reference)}개"

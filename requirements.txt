@@ -2,4 +2,3 @@ streamlit
 pandas
 pdfplumber
 openpyxl
-typesafe-sdk
